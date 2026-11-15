@@ -1,0 +1,74 @@
+name: Build AAB
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Get bundletool and aapt2
+        run: |
+          AAPT2=$(ls -d "$ANDROID_HOME"/build-tools/*/aapt2 | sort -V | tail -1)
+          echo "AAPT2=$AAPT2" >> "$GITHUB_ENV"
+          "$AAPT2" version
+          curl -fsSL -o "$RUNNER_TEMP/bundletool.jar" \
+            https://github.com/google/bundletool/releases/download/1.18.1/bundletool-all-1.18.1.jar
+
+      - name: Convert APK to AAB layout
+        run: |
+          rm -rf work && mkdir -p work/proto work/base/manifest work/base/dex
+          "$AAPT2" convert --output-format proto -o work/proto.apk game.apk
+          unzip -q work/proto.apk -d work/proto
+          cp work/proto/AndroidManifest.xml work/base/manifest/
+          cp work/proto/resources.pb work/base/
+          cp -r work/proto/res work/base/res
+          cp work/proto/classes*.dex work/base/dex/
+          [ -d work/proto/assets ] && cp -r work/proto/assets work/base/assets || true
+          [ -d work/proto/lib ] && cp -r work/proto/lib work/base/lib || true
+          (cd work/base && zip -qr ../base.zip .)
+          java -jar "$RUNNER_TEMP/bundletool.jar" build-bundle \
+            --modules=work/base.zip --output=work/unsigned.aab
+
+      - name: Sign AAB
+        env:
+          KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.KEY_ALIAS }}
+        shell: bash
+        run: |
+          mkdir -p out
+          if [ -n "$KS_B64" ]; then
+            KS="$RUNNER_TEMP/upload.jks"
+            echo "$KS_B64" | base64 -d > "$KS"
+            ALIAS="${KS_ALIAS:-upload}"
+            PASS="$KS_PASS"
+          else
+            KS="out/upload.jks"
+            ALIAS="upload"
+            PASS=$(openssl rand -hex 12)
+            keytool -genkeypair -keystore "$KS" -alias "$ALIAS" -keyalg RSA -keysize 2048 \
+              -validity 10000 -storepass "$PASS" -keypass "$PASS" \
+              -dname "CN=Battle of Dots, O=BattleDots, C=UZ"
+            printf 'alias: %s\npassword: %s\n' "$ALIAS" "$PASS" > out/KEYSTORE_INFO.txt
+          fi
+          export PASS
+          cp work/unsigned.aab out/BattleOfDots.aab
+          jarsigner -keystore "$KS" -storepass:env PASS -keypass:env PASS \
+            -sigalg SHA256withRSA -digestalg SHA-256 out/BattleOfDots.aab "$ALIAS"
+          jarsigner -verify out/BattleOfDots.aab
+          java -jar "$RUNNER_TEMP/bundletool.jar" validate --bundle=out/BattleOfDots.aab
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BattleOfDots-AAB
+          path: out/
